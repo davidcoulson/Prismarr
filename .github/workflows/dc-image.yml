@@ -1,0 +1,82 @@
+name: Fork image (ghcr)
+
+# Fork-only workflow (davidcoulson/Prismarr): builds the patched image and
+# pushes it to ghcr.io/<owner>/prismarr with immutable tags only — the
+# version tag (e.g. 1.2.0-dc1, from a v1.2.0-dc1 git tag) plus sha-<short>.
+# Never `latest`. Upstream's release.yml ignores hyphenated tags, so the two
+# never overlap.
+
+on:
+  push:
+    tags:
+      - "v*-dc*"
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: Build and push (amd64 + arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve names
+        id: ver
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/prismarr" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.ver.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.ref_type == 'tag' }}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=Prismarr (davidcoulson patched build)
+            org.opencontainers.image.description=Prismarr ${{ steps.ver.outputs.version }} — upstream v1.3.0 plus the large-library index and Prowlarr search fixes.
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/frankenphp/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PRISMARR_VERSION=${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
