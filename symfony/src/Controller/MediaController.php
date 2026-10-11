@@ -6,6 +6,7 @@ use App\Controller\Concerns\ApiClientErrorTrait;
 use App\Entity\ServiceInstance;
 use App\Service\ConfigService;
 use App\Service\DisplayPreferencesService;
+use App\Service\Media\LibraryIndexCache;
 use App\Service\Media\MediaLibraryCache;
 use App\Service\Media\MovieLibraryFilter;
 use App\Service\Media\MovieLibraryQuery;
@@ -44,7 +45,26 @@ class MediaController extends AbstractController
         private readonly LoggerInterface $logger,
         private readonly TranslatorInterface $translator,
         private readonly MediaLibraryCache $libraryCache,
+        private readonly ?LibraryIndexCache $libraryIndex = null,
     ) {}
+
+    /**
+     * Slim cached library rows for one Radarr instance (LibraryIndexCache).
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function indexedMovies(ServiceInstance $inst): array
+    {
+        return $this->libraryIndex?->movies($inst)
+            ?? LibraryIndexCache::fetchRows($this->radarr->withInstance($inst));
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function indexedSeries(ServiceInstance $inst): array
+    {
+        return $this->libraryIndex?->series($inst)
+            ?? LibraryIndexCache::fetchRows($this->sonarr->withInstance($inst));
+    }
 
     /**
      * Drop the cached library list for the currently-bound instance after a
@@ -673,7 +693,11 @@ class MediaController extends AbstractController
     public function filmsFilteredIds(Request $request, MovieLibraryFilter $filter): JsonResponse
     {
         try {
-            $movies = $this->radarr->getMovies(RadarrClient::LIBRARY_TIMEOUT);
+            // Same shared list (and filter) the Films page itself renders
+            // from, so "act on the filtered scope" matches what is on screen.
+            $fetch  = fn() => $this->radarr->getMovies(RadarrClient::LIBRARY_TIMEOUT);
+            $slug   = $this->radarr->getInstance()?->getSlug();
+            $movies = $slug !== null ? $this->libraryCache->movies($slug, $fetch) : $fetch();
         } catch (\Throwable $e) {
             $this->logger->warning('Media filmsFilteredIds failed', ['exception' => $e::class, 'message' => $e->getMessage()]);
             return $this->jsonClientError('Radarr', $this->radarr, $this->translator->trans('media.api.network_error'));
@@ -953,7 +977,9 @@ class MediaController extends AbstractController
     public function seriesFilteredIds(Request $request, SeriesLibraryFilter $filter): JsonResponse
     {
         try {
-            $series = $this->sonarr->getSeries(SonarrClient::LIBRARY_TIMEOUT);
+            $fetch  = fn() => $this->sonarr->getSeries(SonarrClient::LIBRARY_TIMEOUT);
+            $slug   = $this->sonarr->getInstance()?->getSlug();
+            $series = $slug !== null ? $this->libraryCache->series($slug, $fetch) : $fetch();
         } catch (\Throwable $e) {
             $this->logger->warning('Media seriesFilteredIds failed', ['exception' => $e::class, 'message' => $e->getMessage()]);
             return $this->jsonClientError('Sonarr', $this->sonarr, $this->translator->trans('media.api.network_error'));
@@ -1145,8 +1171,9 @@ class MediaController extends AbstractController
     public function filmsCollections(): Response
     {
         $collections = $this->radarr->getCollections();
-        // Build tmdbId → hasFile lookup from library
-        $movies = $this->radarr->getMovies(RadarrClient::LIBRARY_TIMEOUT);
+        // Build tmdbId → hasFile lookup from the cached library index
+        $inst   = $this->radarr->getInstance();
+        $movies = $inst !== null ? $this->indexedMovies($inst) : LibraryIndexCache::fetchRows($this->radarr);
         $movieIndex = [];
         foreach ($movies as $m) {
             if ($tmdb = $m['tmdbId'] ?? null) {
@@ -2183,10 +2210,7 @@ class MediaController extends AbstractController
         $out = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_RADARR) as $inst) {
             try {
-                $rows = $this->libraryCache->movies(
-                    $inst->getSlug(),
-                    fn() => $this->radarr->withInstance($inst)->getMovies(RadarrClient::LIBRARY_TIMEOUT),
-                );
+                $rows = $this->indexedMovies($inst);
             } catch (\Throwable $e) {
                 $this->logger->warning('Media globalSearch radarr failed', [
                     'instance' => $inst->getSlug(),
@@ -2225,10 +2249,7 @@ class MediaController extends AbstractController
         $out = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_SONARR) as $inst) {
             try {
-                $rows = $this->libraryCache->series(
-                    $inst->getSlug(),
-                    fn() => $this->sonarr->withInstance($inst)->getSeries(SonarrClient::LIBRARY_TIMEOUT),
-                );
+                $rows = $this->indexedSeries($inst);
             } catch (\Throwable $e) {
                 $this->logger->warning('Media globalSearch sonarr failed', [
                     'instance' => $inst->getSlug(),

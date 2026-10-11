@@ -6,6 +6,7 @@ use App\Entity\Media\WatchlistItem;
 use App\Entity\ServiceInstance;
 use App\Repository\Media\WatchlistItemRepository;
 use App\Service\ConfigService;
+use App\Service\Media\LibraryIndexCache;
 use App\Service\Media\RadarrClient;
 use App\Service\Media\SonarrClient;
 use App\Service\Media\TmdbClient;
@@ -33,7 +34,27 @@ class TmdbController extends AbstractController
         private readonly LoggerInterface $logger,
         private readonly TranslatorInterface $translator,
         private readonly ServiceInstanceProvider   $instances,
+        private readonly ?LibraryIndexCache        $libraryIndex = null,
     ) {}
+
+    /**
+     * Slim library rows for one Radarr instance, from the shared cached
+     * index (see LibraryIndexCache) — never a per-request full fetch.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function indexedMovies(ServiceInstance $inst): array
+    {
+        return $this->libraryIndex?->movies($inst)
+            ?? LibraryIndexCache::fetchRows($this->radarr->withInstance($inst));
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function indexedSeries(ServiceInstance $inst): array
+    {
+        return $this->libraryIndex?->series($inst)
+            ?? LibraryIndexCache::fetchRows($this->sonarr->withInstance($inst));
+    }
 
     #[Route('/decouverte', name: 'tmdb_index')]
     public function index(): Response
@@ -124,8 +145,7 @@ class TmdbController extends AbstractController
         $movieRows = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_RADARR) as $inst) {
             try {
-                $client = $this->radarr->withInstance($inst);
-                foreach ($client->getMovies() as $m) {
+                foreach ($this->indexedMovies($inst) as $m) {
                     $tmdbId = (int) ($m['tmdbId'] ?? 0);
                     if (!$tmdbId || isset($seenMovieTmdb[$tmdbId])) continue;
                     $seenMovieTmdb[$tmdbId] = true;
@@ -149,8 +169,7 @@ class TmdbController extends AbstractController
         $seriesRows = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_SONARR) as $inst) {
             try {
-                $client = $this->sonarr->withInstance($inst);
-                foreach ($client->getRawAllSeries() as $s) {
+                foreach ($this->indexedSeries($inst) as $s) {
                     $tmdbId = (int) ($s['tmdbId'] ?? 0);
                     if (!$tmdbId || isset($seenTvTmdb[$tmdbId])) continue;
                     $seenTvTmdb[$tmdbId] = true;
@@ -949,7 +968,7 @@ class TmdbController extends AbstractController
 
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_RADARR) as $inst) {
             try {
-                $movies = $this->radarr->withInstance($inst)->getMovies();
+                $movies = $this->indexedMovies($inst);
             } catch (\Throwable $e) {
                 $this->logger->warning('TMDb buildLibraryIndex radarr failed', [
                     'instance'  => $inst->getSlug(),
@@ -987,7 +1006,7 @@ class TmdbController extends AbstractController
 
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_SONARR) as $inst) {
             try {
-                $allSeries = $this->sonarr->withInstance($inst)->getRawAllSeries();
+                $allSeries = $this->indexedSeries($inst);
             } catch (\Throwable $e) {
                 $this->logger->warning('TMDb buildLibraryIndex sonarr failed', [
                     'instance'  => $inst->getSlug(),
@@ -1000,9 +1019,8 @@ class TmdbController extends AbstractController
                 $tvdbId = !empty($s['tvdbId']) ? (int) $s['tvdbId'] : null;
                 $tmdbId = !empty($s['tmdbId']) ? (int) $s['tmdbId'] : null;
                 $monitored    = !empty($s['monitored']);
-                $stats        = $s['statistics'] ?? [];
-                $fileCount    = (int) ($stats['episodeFileCount'] ?? 0);
-                $totalEps     = (int) ($stats['episodeCount'] ?? 0);
+                $fileCount    = (int) ($s['episodeFileCount'] ?? 0);
+                $totalEps     = (int) ($s['episodeCount'] ?? 0);
                 $seriesStatus = $s['status'] ?? '';
 
                 if (!$monitored) {
@@ -1101,7 +1119,7 @@ class TmdbController extends AbstractController
         $owners = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_RADARR) as $inst) {
             try {
-                foreach ($this->radarr->withInstance($inst)->getMovies() as $m) {
+                foreach ($this->indexedMovies($inst) as $m) {
                     if ((int) ($m['tmdbId'] ?? 0) !== $tmdbId) continue;
                     $owners[] = [
                         'slug'   => $inst->getSlug(),
@@ -1133,13 +1151,12 @@ class TmdbController extends AbstractController
         $owners = [];
         foreach ($this->instances->getEnabled(ServiceInstance::TYPE_SONARR) as $inst) {
             try {
-                foreach ($this->sonarr->withInstance($inst)->getRawAllSeries() as $s) {
+                foreach ($this->indexedSeries($inst) as $s) {
                     $matchTvdb = $tvdbId > 0 && (int) ($s['tvdbId'] ?? 0) === $tvdbId;
                     $matchTmdb = $tmdbId > 0 && (int) ($s['tmdbId'] ?? 0) === $tmdbId;
                     if (!$matchTvdb && !$matchTmdb) continue;
-                    $stats     = $s['statistics'] ?? [];
-                    $fileCount = (int) ($stats['episodeFileCount'] ?? 0);
-                    $totalEps  = (int) ($stats['episodeCount'] ?? 0);
+                    $fileCount = (int) ($s['episodeFileCount'] ?? 0);
+                    $totalEps  = (int) ($s['episodeCount'] ?? 0);
                     if (!($s['monitored'] ?? false)) {
                         $status = 'unmonitored';
                     } elseif ($totalEps > 0 && $fileCount >= $totalEps) {
